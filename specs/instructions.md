@@ -13,3 +13,5 @@ when I entered linux shell (using `make shell-linux`), and run cargo run / curl,
 Still have issues. Please fix. btw, I've moved shell scripts to ./scripts folder.
 
 I've fixed KVM issue by using a x86 VM. Now check_kvm_status.sh is good. However, it still has errors. Please tune @machine.json if needed. Please do not modify @runner.rs unless absolutely needed.
+
+Cool! The code works! Now please make sure the output just contain the output of the code being executed. Not unnecessary details.
