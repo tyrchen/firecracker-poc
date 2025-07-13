@@ -1,0 +1,19 @@
+# linux.yaml
+# 一个为 Firecracker POC 准备的 Lima 虚拟机配置
+
+# 使用一个稳定的 Ubuntu LTS 版本
+images:
+- location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+- location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+  arch: "x86_64"
+
+# 分配资源
+cpus: 4
+memory: "8GiB"
+disk: "50GiB"
+
+# 关键：将你的项目文件夹挂载到虚拟机里
+mounts:
+- location: "~/projects/mycode/rust/firecracker-poc" # 你的 Mac 上的项目路径
+  writable: true # 允许在虚拟机内修改文件
