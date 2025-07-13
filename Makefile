@@ -16,8 +16,11 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-run-linux:
-	@limactl start --name $(LINUX_NAME) ./linux.yaml
+create-linux:
+	@limactl create --name $(LINUX_NAME) ./linux.yaml
+
+start-linux:
+	@limactl start $(LINUX_NAME)
 
 stop-linux:
 	@limactl stop $(LINUX_NAME)

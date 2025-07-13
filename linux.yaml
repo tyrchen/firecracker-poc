@@ -1,5 +1,6 @@
 # linux.yaml
 # 一个为 Firecracker POC 准备的 Lima 虚拟机配置
+arch: "x86_64"
 
 # 使用一个稳定的 Ubuntu LTS 版本
 images:
@@ -12,6 +13,10 @@ images:
 cpus: 4
 memory: "8GiB"
 disk: "50GiB"
+
+# 重要：启用嵌套虚拟化
+vmType: "qemu"
+nestedVirtualization: true
 
 # 关键：将你的项目文件夹挂载到虚拟机里
 mounts:

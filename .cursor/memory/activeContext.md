@@ -1,15 +1,25 @@
 # Firecracker POC - Active Context
 
 ## Current Phase
-**Mode**: BUILD (Implementation)
-**Stage**: Web Service Complete
-**Focus**: Testing and Validation
+**Mode**: BUILD (Implementation) - Phase 5 Testing
+**Stage**: Firecracker Environment Setup
+**Focus**: Resolving Firecracker installation and testing end-to-end functionality
 
 ## Immediate Context
 - **Project Type**: Rust-based web service for secure code execution
 - **Architecture**: Axum web server + Firecracker microVM integration
 - **Target**: Single `/execute` API endpoint for Python code execution
 - **Security Model**: Complete isolation per execution via fresh microVMs
+
+## Current Issue & Resolution
+**Problem**: Firecracker binary not available on macOS host environment
+- Error: "Code execution failed: Process spawn error: Failed to start Firecracker: Exec format error (os error 8)"
+- Root cause: Running on macOS instead of Linux environment
+
+**Solution**: Lima VM environment setup
+- Lima VM `firecracker-vm` is running and configured
+- Created `setup_firecracker.sh` script to install Firecracker in Lima VM
+- Created `test_api.sh` script for comprehensive API testing
 
 ## Active Work Stream
 1. **Memory Bank Initialization** ✅
@@ -40,10 +50,25 @@
    - Created 6 unit tests covering all endpoint scenarios
    - Integrated successfully with Firecracker runner module
 
-5. **Next Immediate Steps**
-   - Create end-to-end testing scenarios
-   - Test the complete POC with curl commands
-   - Validate all success criteria are met
+5. **Environment Setup & Testing** 🔄
+   - Identified Firecracker availability issue on macOS
+   - Created automated installation script for Linux environment
+   - Set up Lima VM configuration for proper Linux testing environment
+   - Created comprehensive test suite for API validation
+
+## Required Environment Setup
+
+### Lima VM Configuration
+- VM: `firecracker-vm` (Ubuntu 22.04 LTS)
+- Resources: 4 CPUs, 8GiB RAM, 50GiB disk
+- Mount: Project directory at `~/projects/mycode/rust/firecracker-poc`
+
+### Setup Instructions
+1. Ensure Lima VM is running: `limactl list` should show `firecracker-vm` as Running
+2. Shell into VM: `limactl shell firecracker-vm`
+3. Navigate to project: `cd /Users/tchen/projects/mycode/rust/firecracker-poc`
+4. Run setup script: `./setup_firecracker.sh`
+5. Test API: `./test_api.sh` (in separate terminal)
 
 ## Key Technical Decisions Made
 - **Web Framework**: `axum` (modern, tokio-integrated)
@@ -51,6 +76,7 @@
 - **Communication**: HTTP API via Unix socket
 - **Isolation**: Fresh VM per request (no pooling in POC)
 - **Language Support**: Python only for POC
+- **Development Environment**: Lima VM for Linux compatibility
 
 ## Current Dependencies Status
 ```toml
@@ -59,8 +85,12 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```
 
 ## Critical Success Factors
@@ -68,23 +98,28 @@ uuid = { version = "1", features = ["v4"] }
 - Proper error handling and resource cleanup
 - Secure process isolation
 - Reliable stdout/stderr capture
+- **Firecracker binary availability in Linux environment**
 
 ## Current Blockers
-- None identified
+- **User needs to run setup script in Lima VM**
 
 ## Environment Requirements
-- Firecracker binary available in PATH
-- Linux kernel image: `./hello-vmlinux.bin`
-- Root filesystem: `./alpine-python.ext4`
+- Firecracker binary (installed by setup script)
+- Linux kernel image: `./hello-vmlinux.bin` ✅
+- Root filesystem: `./alpine-python.ext4` ✅
 - Write permissions for socket creation in `/tmp/`
 
 ## Testing Strategy
-- Unit tests for data structures
-- Integration tests for VM lifecycle
-- End-to-end API testing with curl
+- Unit tests for data structures ✅
+- Integration tests for VM lifecycle ✅
+- End-to-end API testing with curl (setup_firecracker.sh + test_api.sh)
 - Resource cleanup verification
 
 ## Next Session Focus
-**Priority 1**: End-to-end testing and validation
-**Priority 2**: Complete POC demonstration with curl
-**Priority 3**: Performance testing and final documentation
+**Priority 1**: Run setup script in Lima VM to install Firecracker
+**Priority 2**: Complete end-to-end testing with test script
+**Priority 3**: Validate all success criteria and complete POC demonstration
+
+## Setup Scripts Created
+- `setup_firecracker.sh`: Downloads and installs Firecracker v1.7.0 for current architecture
+- `test_api.sh`: Comprehensive API testing suite for validation
