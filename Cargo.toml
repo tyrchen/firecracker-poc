@@ -23,3 +23,7 @@ reqwest = { version = "0.12", features = [
   "json",
 ] } # 用于和 Firecracker API socket 通信
 uuid = { version = "1", features = ["v4"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
