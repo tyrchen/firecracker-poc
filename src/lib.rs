@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod runner;
+
+// Re-export the main function for easy access
+pub use runner::run_in_vm;
+
 /// Request structure for code execution
 #[derive(Debug, Deserialize, Clone)]
 pub struct ExecuteRequest {
