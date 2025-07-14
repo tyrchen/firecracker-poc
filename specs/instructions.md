@@ -17,3 +17,13 @@ I've fixed KVM issue by using a x86 VM. Now check_kvm_status.sh is good. However
 Cool! The code works! Now please make sure the output just contain the output of the code being executed. Not unnecessary details.
 
 Please make sure execute code is running under firecracker VM that is created. Here it run on host.
+
+Please only output execution result. The current output is too verbose.
+
+The stdout is empty. Didn't get 5 as the stdout for the python code.
+
+Still the same. No output. Can you double check `execute_code` to make sure that the code has actually been executed by python3 in the VM?
+
+This solution doesn't work. Can you revisit the whole code running solution once again? Do you have (shall you preserve) a handler for the created VM that could be used? What other methods for the code to be injected to the VM?
+
+Got shared file issue, please fix this. Please stick to the file sharing solution.

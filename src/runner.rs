@@ -3,43 +3,297 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Method, Request, Uri};
 use hyper_util::client::legacy::Client;
-use hyperlocal::{UnixClientExt, UnixConnector};
+use hyper_util::rt::TokioExecutor;
+use hyperlocal::UnixConnector;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::time::timeout;
+use tracing::warn;
 
 /// VM Manager for handling Firecracker VM lifecycle
 #[allow(dead_code)]
 pub struct VMManager {
     vm_id: String,
     socket_path: String,
+    shared_img: String,
     process: Option<Child>,
 }
 
 impl Default for VMManager {
     fn default() -> Self {
-        Self::new()
+        // This is now only used for tests that don't need a real image.
+        // The main path uses `VMManager::new().await`.
+        let vm_id = generate_vm_id();
+        Self {
+            vm_id: vm_id.clone(),
+            socket_path: format!("/tmp/firecracker-{}.socket", vm_id),
+            shared_img: format!("/tmp/firecracker-shared-{}.ext4", vm_id),
+            process: None,
+        }
     }
 }
 
+/// Execute Python code in a fresh Firecracker microVM
+pub async fn run_in_vm(code: &str) -> Result<ExecuteResponse, ExecutionError> {
+    // The creation of the VMManager, which involves creating a file, is async.
+    let mut vm_manager = VMManager::new().await?;
+
+    // 1. Prepare the shared image with the code FIRST
+    vm_manager.prepare_shared_image(code).await?;
+
+    // 2. Start Firecracker. The boot args will now auto-execute and shutdown.
+    vm_manager.start_firecracker().await?;
+    vm_manager.configure_and_run_vm().await?;
+
+    // 3. Wait for the VM process to exit
+    if let Some(ref mut process) = vm_manager.process {
+        // Wait up to 30 seconds for the VM to run and self-terminate
+        match timeout(Duration::from_secs(30), process.wait()).await {
+            Ok(Ok(_)) => (), // VM exited as expected
+            Ok(Err(e)) => {
+                return Err(ExecutionError::ProcessSpawnError(format!(
+                    "VM process wait failed: {}",
+                    e
+                )));
+            }
+            Err(_) => return Err(ExecutionError::TimeoutError),
+        }
+    } else {
+        return Err(ExecutionError::ProcessSpawnError(
+            "VM process was not started".to_string(),
+        ));
+    }
+
+    // 4. Get the results from the shared image
+    let result = vm_manager.read_results_from_shared_image().await?;
+
+    // 5. Cleanup
+    vm_manager.cleanup().await?;
+
+    Ok(result)
+}
+
 impl VMManager {
-    /// Create a new VM manager with unique ID
-    pub fn new() -> Self {
+    /// Create a new VM manager with a unique ID and a dedicated shared filesystem image.
+    pub async fn new() -> Result<Self, ExecutionError> {
         let vm_id = generate_vm_id();
         let socket_path = format!("/tmp/firecracker-{}.socket", vm_id);
+        let shared_img = format!("/tmp/firecracker-shared-{}.ext4", vm_id);
 
-        Self {
+        // Create a small ext4 image (10MB) for file sharing
+        let create_img_status = tokio::process::Command::new("dd")
+            .args([
+                "if=/dev/zero",
+                &format!("of={}", shared_img),
+                "bs=1M",
+                "count=10",
+            ])
+            .status()
+            .await
+            .map_err(|e| ExecutionError::ResourceError(format!("Failed to execute dd: {}", e)))?;
+
+        if !create_img_status.success() {
+            return Err(ExecutionError::ResourceError(
+                "Failed to create shared image file with dd".to_string(),
+            ));
+        }
+
+        // Format as ext4
+        let format_status = tokio::process::Command::new("mkfs.ext4")
+            .args(["-F", &shared_img])
+            .status()
+            .await
+            .map_err(|e| {
+                ExecutionError::ResourceError(format!("Failed to execute mkfs.ext4: {}", e))
+            })?;
+
+        if !format_status.success() {
+            return Err(ExecutionError::ResourceError(
+                "Failed to format shared image with mkfs.ext4".to_string(),
+            ));
+        }
+
+        Ok(Self {
             vm_id,
             socket_path,
+            shared_img,
             process: None,
+        })
+    }
+
+    /// Changes the ownership of the mounted directory to the current user.
+    async fn set_mount_ownership(&self, mount_dir: &str) -> Result<(), ExecutionError> {
+        let user_output = tokio::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .await
+            .map_err(|e| ExecutionError::ResourceError(format!("Failed to run `id -un`: {}", e)))?;
+        if !user_output.status.success() {
+            return Err(ExecutionError::ResourceError("`id -un` failed".to_string()));
         }
+        let user = String::from_utf8_lossy(&user_output.stdout)
+            .trim()
+            .to_string();
+
+        let group_output = tokio::process::Command::new("id")
+            .arg("-gn")
+            .output()
+            .await
+            .map_err(|e| ExecutionError::ResourceError(format!("Failed to run `id -gn`: {}", e)))?;
+        if !group_output.status.success() {
+            return Err(ExecutionError::ResourceError("`id -gn` failed".to_string()));
+        }
+        let group = String::from_utf8_lossy(&group_output.stdout)
+            .trim()
+            .to_string();
+
+        let chown_status = tokio::process::Command::new("sudo")
+            .arg("chown")
+            .arg("-R")
+            .arg(format!("{}:{}", &user, &group))
+            .arg(mount_dir)
+            .status()
+            .await
+            .map_err(|e| ExecutionError::ResourceError(format!("Failed to run chown: {}", e)))?;
+
+        if !chown_status.success() {
+            return Err(ExecutionError::ResourceError(
+                "Failed to change ownership of mount point".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Prepares the shared filesystem image by mounting it and writing the Python script.
+    pub async fn prepare_shared_image(&self, code: &str) -> Result<(), ExecutionError> {
+        let mount_dir = format!("/tmp/mount-{}", self.vm_id);
+        tokio::fs::create_dir_all(&mount_dir).await.map_err(|e| {
+            ExecutionError::ResourceError(format!("Failed to create mount directory: {}", e))
+        })?;
+
+        // Ensure the loop module is loaded. This might fail if it's built-in, which is fine.
+        let modprobe_status = tokio::process::Command::new("sudo")
+            .arg("modprobe")
+            .arg("loop")
+            .status()
+            .await;
+        if let Ok(status) = modprobe_status {
+            if !status.success() {
+                warn!(
+                    "'sudo modprobe loop' failed. This may not be an issue if the module is already loaded or built-in."
+                );
+            }
+        } else {
+            warn!("'sudo modprobe loop' failed to execute.");
+        }
+
+        let mount_status = tokio::process::Command::new("sudo")
+            .arg("mount")
+            .args(["-o", "loop", &self.shared_img, &mount_dir])
+            .status()
+            .await
+            .map_err(|e| {
+                ExecutionError::ResourceError(format!("Failed to execute mount: {}", e))
+            })?;
+
+        if !mount_status.success() {
+            let _ = tokio::fs::remove_dir_all(&mount_dir).await;
+            return Err(ExecutionError::ResourceError(
+                "Failed to mount shared image".to_string(),
+            ));
+        }
+
+        self.set_mount_ownership(&mount_dir).await?;
+
+        let script_file = format!("{}/script.py", mount_dir);
+        tokio::fs::write(&script_file, code).await.map_err(|e| {
+            ExecutionError::ResourceError(format!("Failed to write script.py: {}", e))
+        })?;
+
+        let umount_status = tokio::process::Command::new("sudo")
+            .arg("umount")
+            .arg(&mount_dir)
+            .status()
+            .await
+            .map_err(|e| {
+                ExecutionError::ResourceError(format!("Failed to execute umount: {}", e))
+            })?;
+
+        if !umount_status.success() {
+            let _ = tokio::fs::remove_dir_all(&mount_dir).await;
+            return Err(ExecutionError::ResourceError(
+                "Failed to unmount shared image".to_string(),
+            ));
+        }
+
+        let _ = tokio::fs::remove_dir_all(&mount_dir).await;
+        Ok(())
+    }
+
+    /// Reads the execution results from the shared filesystem image after the VM has run.
+    pub async fn read_results_from_shared_image(&self) -> Result<ExecuteResponse, ExecutionError> {
+        let mount_dir = format!("/tmp/mount-{}", self.vm_id);
+        tokio::fs::create_dir_all(&mount_dir).await.map_err(|e| {
+            ExecutionError::ResourceError(format!("Failed to recreate mount directory: {}", e))
+        })?;
+
+        let mount_status = tokio::process::Command::new("sudo")
+            .arg("mount")
+            .args(["-o", "loop", &self.shared_img, &mount_dir])
+            .status()
+            .await
+            .map_err(|e| {
+                ExecutionError::ResourceError(format!("Failed to execute mount for reading: {}", e))
+            })?;
+
+        if !mount_status.success() {
+            let _ = tokio::fs::remove_dir_all(&mount_dir).await;
+            return Err(ExecutionError::ResourceError(
+                "Failed to remount shared image for reading".to_string(),
+            ));
+        }
+
+        self.set_mount_ownership(&mount_dir).await?;
+
+        let stdout_file = format!("{}/output.txt", mount_dir);
+        let stderr_file = format!("{}/error.txt", mount_dir);
+        let stdout = tokio::fs::read_to_string(stdout_file)
+            .await
+            .unwrap_or_default();
+        let stderr = tokio::fs::read_to_string(stderr_file)
+            .await
+            .unwrap_or_default();
+
+        let umount_status = tokio::process::Command::new("sudo")
+            .arg("umount")
+            .arg(&mount_dir)
+            .status()
+            .await
+            .map_err(|e| {
+                ExecutionError::ResourceError(format!(
+                    "Failed to execute umount after reading: {}",
+                    e
+                ))
+            })?;
+
+        if !umount_status.success() {
+            warn!("Warning: failed to unmount after reading results.");
+        }
+
+        let _ = tokio::fs::remove_dir_all(&mount_dir).await;
+        let success = stderr.trim().is_empty();
+        Ok(ExecuteResponse {
+            stdout,
+            stderr,
+            success,
+        })
     }
 
     /// Start the Firecracker process
     pub async fn start_firecracker(&mut self) -> Result<(), ExecutionError> {
-        let mut child = tokio::process::Command::new("firecracker")
+        let child = tokio::process::Command::new("firecracker")
             .arg("--api-sock")
             .arg(&self.socket_path)
             .stdin(Stdio::piped())
@@ -49,29 +303,9 @@ impl VMManager {
             .map_err(|e| {
                 ExecutionError::ProcessSpawnError(format!("Failed to start Firecracker: {}", e))
             })?;
-
-        // Wait for the socket to be created
-        let socket_wait = timeout(Duration::from_secs(5), async {
-            loop {
-                if std::path::Path::new(&self.socket_path).exists() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        });
-
-        match socket_wait.await {
-            Ok(_) => {
-                self.process = Some(child);
-                Ok(())
-            }
-            Err(_) => {
-                let _ = child.kill().await;
-                Err(ExecutionError::StartupError(
-                    "Socket creation timeout".to_string(),
-                ))
-            }
-        }
+        self.process = Some(child);
+        tokio::time::sleep(Duration::from_millis(100)).await; // Give time for socket to be created
+        Ok(())
     }
 
     /// Send HTTP request to Firecracker API via Unix socket
@@ -81,10 +315,9 @@ impl VMManager {
         path: &str,
         body: Option<&str>,
     ) -> Result<(), ExecutionError> {
-        let client: Client<UnixConnector, Full<Bytes>> = Client::unix();
-
+        let client: Client<UnixConnector, Full<Bytes>> =
+            Client::builder(TokioExecutor::new()).build(UnixConnector);
         let uri: Uri = hyperlocal::Uri::new(&self.socket_path, path).into();
-
         let mut request_builder = Request::builder().method(method.clone()).uri(uri);
 
         let request = if let Some(json_body) = body {
@@ -105,7 +338,6 @@ impl VMManager {
         })?;
 
         let status = response.status();
-
         if !status.is_success() {
             use http_body_util::BodyExt;
             let body_bytes = response
@@ -118,25 +350,23 @@ impl VMManager {
                     ))
                 })?
                 .to_bytes();
-
             let error_body = String::from_utf8_lossy(&body_bytes);
             return Err(ExecutionError::ApiCommunicationError(format!(
                 "API returned error status: {} for {} {}. Error details: {}",
                 status, method, path, error_body
             )));
         }
-
         Ok(())
     }
 
-    /// Configure the VM via HTTP API
-    pub async fn configure_vm(&self) -> Result<(), ExecutionError> {
-        // Set machine configuration
-        let machine_config = std::fs::read_to_string("fixtures/machine.json").map_err(|e| {
-            ExecutionError::ResourceError(format!("Failed to read machine config: {}", e))
-        })?;
+    /// Configure the VM via HTTP API and starts it
+    pub async fn configure_and_run_vm(&self) -> Result<(), ExecutionError> {
+        let machine_config = tokio::fs::read_to_string("fixtures/machine.json")
+            .await
+            .map_err(|e| {
+                ExecutionError::ResourceError(format!("Failed to read machine config: {}", e))
+            })?;
         let machine_config: serde_json::Value = serde_json::from_str(&machine_config).unwrap();
-
         self.send_api_request(
             Method::PUT,
             "/machine-config",
@@ -147,190 +377,39 @@ impl VMManager {
             ExecutionError::ApiCommunicationError(format!("Machine config failed: {}", e))
         })?;
 
-        // Set boot source
-        let boot_source = serde_json::json!({
-            "kernel_image_path": "./hello-vmlinux.bin",
-            "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
-        });
-
+        let command = "mkdir -p /mnt/shared; mount /dev/vdb /mnt/shared; python3 /mnt/shared/script.py > /mnt/shared/output.txt 2> /mnt/shared/error.txt; sync; reboot -f";
+        let boot_args = format!(
+            "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/bin/sh -- -c \"{}\"",
+            command
+        );
+        let boot_source = serde_json::json!({ "kernel_image_path": "./hello-vmlinux.bin", "boot_args": boot_args });
         self.send_api_request(Method::PUT, "/boot-source", Some(&boot_source.to_string()))
             .await
             .map_err(|e| {
                 ExecutionError::ApiCommunicationError(format!("Boot source config failed: {}", e))
             })?;
 
-        // Set root filesystem
-        let rootfs = serde_json::json!({
-            "drive_id": "rootfs",
-            "path_on_host": "./alpine-python.ext4",
-            "is_root_device": true,
-            "is_read_only": false
-        });
-
+        let rootfs = serde_json::json!({ "drive_id": "rootfs", "path_on_host": "./alpine-python.ext4", "is_root_device": true, "is_read_only": false });
         self.send_api_request(Method::PUT, "/drives/rootfs", Some(&rootfs.to_string()))
             .await
             .map_err(|e| {
                 ExecutionError::ApiCommunicationError(format!("Rootfs config failed: {}", e))
             })?;
 
-        // Start the VM
-        let start_action = serde_json::json!({
-            "action_type": "InstanceStart"
-        });
+        let shared_fs = serde_json::json!({ "drive_id": "shared", "path_on_host": self.shared_img.clone(), "is_root_device": false, "is_read_only": false });
+        self.send_api_request(Method::PUT, "/drives/shared", Some(&shared_fs.to_string()))
+            .await
+            .map_err(|e| {
+                ExecutionError::ApiCommunicationError(format!("Shared fs config failed: {}", e))
+            })?;
 
+        let start_action = serde_json::json!({ "action_type": "InstanceStart" });
         self.send_api_request(Method::PUT, "/actions", Some(&start_action.to_string()))
             .await
             .map_err(|e| {
                 ExecutionError::ApiCommunicationError(format!("VM start failed: {}", e))
             })?;
-
         Ok(())
-    }
-
-    /// Execute Python code inside the Firecracker VM
-    pub async fn execute_code(&mut self, code: &str) -> Result<ExecuteResponse, ExecutionError> {
-        use tokio::time::{Duration, timeout};
-
-        if let Some(ref mut process) = self.process {
-            // Wait for VM to boot up completely (give it time to initialize)
-            tokio::time::sleep(Duration::from_secs(3)).await;
-
-            // Get stdin, stdout, stderr handles
-            let stdin = process.stdin.as_mut().ok_or_else(|| {
-                ExecutionError::ProcessSpawnError("Failed to get VM stdin".to_string())
-            })?;
-
-            let stdout = process.stdout.as_mut().ok_or_else(|| {
-                ExecutionError::ProcessSpawnError("Failed to get VM stdout".to_string())
-            })?;
-
-            let stderr = process.stderr.as_mut().ok_or_else(|| {
-                ExecutionError::ProcessSpawnError("Failed to get VM stderr".to_string())
-            })?;
-
-            // Prepare the command to execute Python code
-            // We need to escape quotes properly for shell execution
-            let escaped_code = code.replace("'", "'\"'\"'");
-            let command = format!(
-                "python3 -c '{}'\necho \"__EXECUTION_COMPLETE__\"\n",
-                escaped_code
-            );
-
-            // Send the command to VM stdin
-            if let Err(e) = stdin.write_all(command.as_bytes()).await {
-                return Err(ExecutionError::ProcessSpawnError(format!(
-                    "Failed to send code to VM: {}",
-                    e
-                )));
-            }
-
-            // Force flush the input
-            if let Err(e) = stdin.flush().await {
-                return Err(ExecutionError::ProcessSpawnError(format!(
-                    "Failed to flush input to VM: {}",
-                    e
-                )));
-            }
-
-            // Read output with timeout
-            let read_timeout = Duration::from_secs(10);
-
-            let mut stdout_buffer = Vec::new();
-            let mut stderr_buffer = Vec::new();
-            let mut temp_buffer = [0u8; 1024];
-
-            // Read stdout until we see the completion marker or timeout
-            let stdout_result: Result<Result<(), ExecutionError>, tokio::time::error::Elapsed> =
-                timeout(read_timeout, async {
-                    loop {
-                        match stdout.read(&mut temp_buffer).await {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                stdout_buffer.extend_from_slice(&temp_buffer[..n]);
-                                let output_str = String::from_utf8_lossy(&stdout_buffer);
-
-                                // Check if we've received the completion marker
-                                if output_str.contains("__EXECUTION_COMPLETE__") {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                return Err(ExecutionError::ProcessSpawnError(format!(
-                                    "Failed to read VM stdout: {}",
-                                    e
-                                )));
-                            }
-                        }
-                    }
-                    Ok(())
-                })
-                .await;
-
-            // Read stderr with a shorter timeout since it should be quick
-            let _stderr_result: Result<Result<(), ExecutionError>, tokio::time::error::Elapsed> =
-                timeout(Duration::from_secs(2), async {
-                    loop {
-                        match stderr.read(&mut temp_buffer).await {
-                            Ok(0) => break, // EOF
-                            Ok(n) => {
-                                stderr_buffer.extend_from_slice(&temp_buffer[..n]);
-                            }
-                            Err(_) => break, // Error reading, assume no more stderr
-                        }
-
-                        // Don't read stderr forever
-                        if stderr_buffer.len() > 10_000 {
-                            break;
-                        }
-                    }
-                    Ok(())
-                })
-                .await;
-
-            // Check for timeout
-            if stdout_result.is_err() {
-                return Err(ExecutionError::TimeoutError);
-            }
-
-            // Process the output
-            let stdout_str = String::from_utf8_lossy(&stdout_buffer);
-            let stderr_str = String::from_utf8_lossy(&stderr_buffer);
-
-            // Remove the completion marker and any VM boot messages
-            let cleaned_stdout = stdout_str
-                .replace("__EXECUTION_COMPLETE__", "")
-                .lines()
-                .filter(|line| {
-                    // Filter out common VM boot messages and keep only Python output
-                    !line.contains("login:")
-                        && !line.contains("Welcome to")
-                        && !line.contains("Alpine Linux")
-                        && !line.contains("localhost")
-                        && !line.contains("#")
-                        && !line.trim().is_empty()
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            let final_stdout = if cleaned_stdout.trim().is_empty() {
-                String::new()
-            } else {
-                cleaned_stdout.trim().to_string() + "\n"
-            };
-
-            let final_stderr = stderr_str.trim().to_string();
-            let success = final_stderr.is_empty();
-
-            Ok(ExecuteResponse {
-                stdout: final_stdout,
-                stderr: final_stderr,
-                success,
-            })
-        } else {
-            Err(ExecutionError::ProcessSpawnError(
-                "No VM process available".to_string(),
-            ))
-        }
     }
 
     /// Clean up VM resources
@@ -339,79 +418,65 @@ impl VMManager {
             let _ = process.kill().await;
             let _ = process.wait().await;
         }
-
-        // Remove socket file
-        if std::path::Path::new(&self.socket_path).exists() {
-            std::fs::remove_file(&self.socket_path).map_err(|e| {
-                ExecutionError::ResourceError(format!("Failed to remove socket: {}", e))
-            })?;
+        if tokio::fs::try_exists(&self.socket_path)
+            .await
+            .unwrap_or(false)
+        {
+            tokio::fs::remove_file(&self.socket_path)
+                .await
+                .map_err(|e| {
+                    ExecutionError::ResourceError(format!("Failed to remove socket: {}", e))
+                })?;
         }
-
+        if tokio::fs::try_exists(&self.shared_img)
+            .await
+            .unwrap_or(false)
+        {
+            tokio::fs::remove_file(&self.shared_img)
+                .await
+                .map_err(|e| {
+                    ExecutionError::ResourceError(format!("Failed to remove shared image: {}", e))
+                })?;
+        }
         Ok(())
     }
-}
-
-/// Execute Python code in a fresh Firecracker microVM
-pub async fn run_in_vm(code: &str) -> Result<ExecuteResponse, ExecutionError> {
-    let mut vm_manager = VMManager::new();
-
-    // Start Firecracker process
-    vm_manager.start_firecracker().await?;
-
-    // Configure the VM
-    vm_manager.configure_vm().await?;
-
-    // Execute the code
-    let result = vm_manager.execute_code(code).await;
-
-    // Clean up resources
-    let _ = vm_manager.cleanup().await;
-
-    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_vm_manager_creation() {
-        let vm_manager = VMManager::new();
+    #[tokio::test]
+    async fn test_vm_manager_creation() {
+        // This test requires root to use dd, mkfs.ext4, and mount.
+        // It's more of an integration test. For now, we just test the struct creation.
+        let vm_manager = VMManager::default();
         assert!(!vm_manager.vm_id.is_empty());
         assert!(vm_manager.socket_path.contains("/tmp/firecracker-"));
-        assert!(vm_manager.socket_path.ends_with(".socket"));
+        assert!(vm_manager.shared_img.ends_with(".ext4"));
     }
 
     #[tokio::test]
     async fn test_vm_manager_cleanup() {
         let socket_path = "/tmp/test-socket.socket";
+        let shared_img_path = "/tmp/test-shared.ext4";
 
-        // Create a test socket file
-        std::fs::File::create(socket_path).unwrap();
-        assert!(std::path::Path::new(socket_path).exists());
+        // Create test files
+        tokio::fs::File::create(socket_path).await.unwrap();
+        tokio::fs::File::create(shared_img_path).await.unwrap();
+        assert!(tokio::fs::try_exists(socket_path).await.unwrap());
+        assert!(tokio::fs::try_exists(shared_img_path).await.unwrap());
 
-        // Create VMManager with test socket
-        let mut vm_manager = VMManager::new();
-        vm_manager.socket_path = socket_path.to_string();
+        // Create VMManager with test paths
+        let vm_manager = VMManager {
+            socket_path: socket_path.to_string(),
+            shared_img: shared_img_path.to_string(),
+            ..Default::default()
+        };
 
-        // Cleanup should remove the socket
+        // Cleanup should remove the files
         vm_manager.cleanup().await.unwrap();
-        assert!(!std::path::Path::new(socket_path).exists());
-    }
-
-    #[test]
-    fn test_python_command_escaping() {
-        let code = "print('hello world')";
-        let expected = "python3 -c 'print(\\'hello world\\')'\n";
-        let actual = format!("python3 -c '{}'\n", code.replace("'", "\\'"));
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn test_complex_python_code_escaping() {
-        let code = "x = 'test'; print(f'Value: {x}')";
-        let expected = "python3 -c 'x = \\'test\\'; print(f\\'Value: {x}\\')'\n";
-        let actual = format!("python3 -c '{}'\n", code.replace("'", "\\'"));
-        assert_eq!(actual, expected);
+        assert!(!tokio::fs::try_exists(socket_path).await.unwrap());
+        assert!(!tokio::fs::try_exists(shared_img_path).await.unwrap());
     }
 }
