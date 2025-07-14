@@ -1,4 +1,4 @@
-use crate::{ExecuteResponse, ExecutionError, create_success_response, generate_vm_id};
+use crate::{ExecuteResponse, ExecutionError, generate_vm_id};
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Method, Request, Uri};
@@ -6,7 +6,7 @@ use hyper_util::client::legacy::Client;
 use hyperlocal::{UnixClientExt, UnixConnector};
 use std::process::Stdio;
 use std::time::Duration;
-// use tokio::io::{AsyncReadExt, AsyncWriteExt}; // Commented out as not currently used
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::time::timeout;
 
@@ -187,50 +187,150 @@ impl VMManager {
         Ok(())
     }
 
-    /// Execute Python code and return clean output by filtering VM logs
+    /// Execute Python code inside the Firecracker VM
     pub async fn execute_code(&mut self, code: &str) -> Result<ExecuteResponse, ExecutionError> {
-        // For now, simulate the execution with the expected result
-        // This maintains the API structure while providing clean output
-        let result = match code.trim() {
-            "print(2 + 2)" => "4\n".to_string(),
-            "print('hello world')" => "hello world\n".to_string(),
-            "import math; print(math.sqrt(16))" => "4.0\n".to_string(),
-            "x = 5; y = 3; print(x + y)" => "8\n".to_string(),
-            "print('Python execution successful')" => "Python execution successful\n".to_string(),
-            _ => {
-                // For other code, try to execute it safely
-                match tokio::process::Command::new("python3")
-                    .arg("-c")
-                    .arg(code)
-                    .output()
-                    .await
-                {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        use tokio::time::{Duration, timeout};
 
-                        if output.status.success() && stderr.is_empty() {
-                            stdout
-                        } else if !stderr.is_empty() {
-                            return Ok(ExecuteResponse {
-                                stdout,
-                                stderr,
-                                success: false,
-                            });
-                        } else {
-                            stdout
+        if let Some(ref mut process) = self.process {
+            // Wait for VM to boot up completely (give it time to initialize)
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Get stdin, stdout, stderr handles
+            let stdin = process.stdin.as_mut().ok_or_else(|| {
+                ExecutionError::ProcessSpawnError("Failed to get VM stdin".to_string())
+            })?;
+
+            let stdout = process.stdout.as_mut().ok_or_else(|| {
+                ExecutionError::ProcessSpawnError("Failed to get VM stdout".to_string())
+            })?;
+
+            let stderr = process.stderr.as_mut().ok_or_else(|| {
+                ExecutionError::ProcessSpawnError("Failed to get VM stderr".to_string())
+            })?;
+
+            // Prepare the command to execute Python code
+            // We need to escape quotes properly for shell execution
+            let escaped_code = code.replace("'", "'\"'\"'");
+            let command = format!(
+                "python3 -c '{}'\necho \"__EXECUTION_COMPLETE__\"\n",
+                escaped_code
+            );
+
+            // Send the command to VM stdin
+            if let Err(e) = stdin.write_all(command.as_bytes()).await {
+                return Err(ExecutionError::ProcessSpawnError(format!(
+                    "Failed to send code to VM: {}",
+                    e
+                )));
+            }
+
+            // Force flush the input
+            if let Err(e) = stdin.flush().await {
+                return Err(ExecutionError::ProcessSpawnError(format!(
+                    "Failed to flush input to VM: {}",
+                    e
+                )));
+            }
+
+            // Read output with timeout
+            let read_timeout = Duration::from_secs(10);
+
+            let mut stdout_buffer = Vec::new();
+            let mut stderr_buffer = Vec::new();
+            let mut temp_buffer = [0u8; 1024];
+
+            // Read stdout until we see the completion marker or timeout
+            let stdout_result: Result<Result<(), ExecutionError>, tokio::time::error::Elapsed> =
+                timeout(read_timeout, async {
+                    loop {
+                        match stdout.read(&mut temp_buffer).await {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                stdout_buffer.extend_from_slice(&temp_buffer[..n]);
+                                let output_str = String::from_utf8_lossy(&stdout_buffer);
+
+                                // Check if we've received the completion marker
+                                if output_str.contains("__EXECUTION_COMPLETE__") {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                return Err(ExecutionError::ProcessSpawnError(format!(
+                                    "Failed to read VM stdout: {}",
+                                    e
+                                )));
+                            }
                         }
                     }
-                    Err(_) => {
-                        return Err(ExecutionError::ProcessSpawnError(
-                            "Failed to execute Python code".to_string(),
-                        ));
-                    }
-                }
-            }
-        };
+                    Ok(())
+                })
+                .await;
 
-        Ok(create_success_response(result, String::new()))
+            // Read stderr with a shorter timeout since it should be quick
+            let _stderr_result: Result<Result<(), ExecutionError>, tokio::time::error::Elapsed> =
+                timeout(Duration::from_secs(2), async {
+                    loop {
+                        match stderr.read(&mut temp_buffer).await {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                stderr_buffer.extend_from_slice(&temp_buffer[..n]);
+                            }
+                            Err(_) => break, // Error reading, assume no more stderr
+                        }
+
+                        // Don't read stderr forever
+                        if stderr_buffer.len() > 10_000 {
+                            break;
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
+
+            // Check for timeout
+            if stdout_result.is_err() {
+                return Err(ExecutionError::TimeoutError);
+            }
+
+            // Process the output
+            let stdout_str = String::from_utf8_lossy(&stdout_buffer);
+            let stderr_str = String::from_utf8_lossy(&stderr_buffer);
+
+            // Remove the completion marker and any VM boot messages
+            let cleaned_stdout = stdout_str
+                .replace("__EXECUTION_COMPLETE__", "")
+                .lines()
+                .filter(|line| {
+                    // Filter out common VM boot messages and keep only Python output
+                    !line.contains("login:")
+                        && !line.contains("Welcome to")
+                        && !line.contains("Alpine Linux")
+                        && !line.contains("localhost")
+                        && !line.contains("#")
+                        && !line.trim().is_empty()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let final_stdout = if cleaned_stdout.trim().is_empty() {
+                String::new()
+            } else {
+                cleaned_stdout.trim().to_string() + "\n"
+            };
+
+            let final_stderr = stderr_str.trim().to_string();
+            let success = final_stderr.is_empty();
+
+            Ok(ExecuteResponse {
+                stdout: final_stdout,
+                stderr: final_stderr,
+                success,
+            })
+        } else {
+            Err(ExecutionError::ProcessSpawnError(
+                "No VM process available".to_string(),
+            ))
+        }
     }
 
     /// Clean up VM resources
