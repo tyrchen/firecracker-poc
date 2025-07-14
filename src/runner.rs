@@ -18,6 +18,8 @@ pub struct VMManager {
     socket_path: String,
     shared_img: String,
     process: Option<Child>,
+    stdout_log_path: String,
+    stderr_log_path: String,
 }
 
 impl Default for VMManager {
@@ -30,6 +32,8 @@ impl Default for VMManager {
             socket_path: format!("/tmp/firecracker-{}.socket", vm_id),
             shared_img: format!("/tmp/firecracker-shared-{}.ext4", vm_id),
             process: None,
+            stdout_log_path: format!("/tmp/fc-stdout-{}.log", vm_id),
+            stderr_log_path: format!("/tmp/fc-stderr-{}.log", vm_id),
         }
     }
 }
@@ -47,17 +51,33 @@ pub async fn run_in_vm(code: &str) -> Result<ExecuteResponse, ExecutionError> {
     vm_manager.configure_and_run_vm().await?;
 
     // 3. Wait for the VM process to exit
-    if let Some(ref mut process) = vm_manager.process {
-        // Wait up to 30 seconds for the VM to run and self-terminate
+    if let Some(mut process) = vm_manager.process.take() {
         match timeout(Duration::from_secs(30), process.wait()).await {
-            Ok(Ok(_)) => (), // VM exited as expected
+            Ok(Ok(exit_status)) => {
+                tracing::info!("Firecracker process exited with status: {}", exit_status);
+            }
             Ok(Err(e)) => {
                 return Err(ExecutionError::ProcessSpawnError(format!(
-                    "VM process wait failed: {}",
-                    e
+                    "Failed to wait for Firecracker process: {}",
+                    e,
                 )));
             }
-            Err(_) => return Err(ExecutionError::TimeoutError),
+            Err(_) => {
+                // Timeout
+                let _ = process.kill().await; // Kill the hanging process
+                // Now read the logs
+                let stdout_log = tokio::fs::read_to_string(&vm_manager.stdout_log_path)
+                    .await
+                    .unwrap_or_else(|e| format!("Failed to read stdout log: {}", e));
+                let stderr_log = tokio::fs::read_to_string(&vm_manager.stderr_log_path)
+                    .await
+                    .unwrap_or_else(|e| format!("Failed to read stderr log: {}", e));
+                let log_details = format!(
+                    "Firecracker stdout (serial console):\n{}\n\nFirecracker stderr:\n{}",
+                    stdout_log, stderr_log
+                );
+                return Err(ExecutionError::TimeoutErrorWithLogs(log_details));
+            }
         }
     } else {
         return Err(ExecutionError::ProcessSpawnError(
@@ -80,6 +100,8 @@ impl VMManager {
         let vm_id = generate_vm_id();
         let socket_path = format!("/tmp/firecracker-{}.socket", vm_id);
         let shared_img = format!("/tmp/firecracker-shared-{}.ext4", vm_id);
+        let stdout_log_path = format!("/tmp/fc-stdout-{}.log", vm_id);
+        let stderr_log_path = format!("/tmp/fc-stderr-{}.log", vm_id);
 
         // Create a small ext4 image (10MB) for file sharing
         let create_img_status = tokio::process::Command::new("dd")
@@ -119,6 +141,8 @@ impl VMManager {
             socket_path,
             shared_img,
             process: None,
+            stdout_log_path,
+            stderr_log_path,
         })
     }
 
@@ -259,6 +283,19 @@ impl VMManager {
 
         let stdout_file = format!("{}/output.txt", mount_dir);
         let stderr_file = format!("{}/error.txt", mount_dir);
+
+        // If neither output nor error file was created, the script likely didn't run.
+        if !tokio::fs::try_exists(&stdout_file).await.unwrap_or(false)
+            && !tokio::fs::try_exists(&stderr_file).await.unwrap_or(false)
+        {
+            let _ = tokio::fs::remove_dir_all(&mount_dir).await; // Clean up mount dir
+            return Ok(ExecuteResponse {
+                stdout: "".to_string(),
+                stderr: "Execution failed: output files not found. The VM may have panicked or the script failed to produce output/error files.".to_string(),
+                success: false,
+            });
+        }
+
         let stdout = tokio::fs::read_to_string(stdout_file)
             .await
             .unwrap_or_default();
@@ -293,12 +330,19 @@ impl VMManager {
 
     /// Start the Firecracker process
     pub async fn start_firecracker(&mut self) -> Result<(), ExecutionError> {
+        let stdout_log_file = std::fs::File::create(&self.stdout_log_path).map_err(|e| {
+            ExecutionError::ResourceError(format!("cannot create stdout log: {}", e))
+        })?;
+        let stderr_log_file = std::fs::File::create(&self.stderr_log_path).map_err(|e| {
+            ExecutionError::ResourceError(format!("cannot create stderr log: {}", e))
+        })?;
+
         let child = tokio::process::Command::new("firecracker")
             .arg("--api-sock")
             .arg(&self.socket_path)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(stdout_log_file)
+            .stderr(stderr_log_file)
             .spawn()
             .map_err(|e| {
                 ExecutionError::ProcessSpawnError(format!("Failed to start Firecracker: {}", e))
@@ -378,8 +422,12 @@ impl VMManager {
         })?;
 
         let command = "mkdir -p /mnt/shared; mount /dev/vdb /mnt/shared; python3 /mnt/shared/script.py > /mnt/shared/output.txt 2> /mnt/shared/error.txt; sync; reboot -f";
+        // The shell command must be passed as a single token to the kernel.
+        // We wrap the command in escaped double-quotes `\"...\"` which are serialized
+        // to `\\"...\\"` in JSON. The kernel parses this correctly, passing a single
+        // quoted argument to `/bin/sh -c`.
         let boot_args = format!(
-            "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/bin/sh -- -c \"{}\"",
+            "console=ttyS0 reboot=k panic=1 pci=off init=/bin/sh -c \"{}\"",
             command
         );
         let boot_source = serde_json::json!({ "kernel_image_path": "./hello-vmlinux.bin", "boot_args": boot_args });
@@ -436,6 +484,26 @@ impl VMManager {
                 .await
                 .map_err(|e| {
                     ExecutionError::ResourceError(format!("Failed to remove shared image: {}", e))
+                })?;
+        }
+        if tokio::fs::try_exists(&self.stdout_log_path)
+            .await
+            .unwrap_or(false)
+        {
+            tokio::fs::remove_file(&self.stdout_log_path)
+                .await
+                .map_err(|e| {
+                    ExecutionError::ResourceError(format!("Failed to remove stdout log: {}", e))
+                })?;
+        }
+        if tokio::fs::try_exists(&self.stderr_log_path)
+            .await
+            .unwrap_or(false)
+        {
+            tokio::fs::remove_file(&self.stderr_log_path)
+                .await
+                .map_err(|e| {
+                    ExecutionError::ResourceError(format!("Failed to remove stderr log: {}", e))
                 })?;
         }
         Ok(())

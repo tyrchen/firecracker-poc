@@ -1,13 +1,15 @@
+use axum::{http::StatusCode, response::IntoResponse, response::Json};
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use thiserror::Error;
+use tracing::error;
 
 pub mod runner;
 
 // Re-export the main function for easy access
 pub use runner::run_in_vm;
 
-/// Request structure for code execution
-#[derive(Debug, Deserialize, Clone)]
+/// Request body for code execution
+#[derive(Serialize, Deserialize)]
 pub struct ExecuteRequest {
     /// Python code to execute in the microVM
     pub code: String,
@@ -24,42 +26,43 @@ pub struct ExecuteResponse {
     pub success: bool,
 }
 
-/// Errors that can occur during code execution
-#[derive(Debug, Clone)]
+#[derive(Error, Debug)]
 pub enum ExecutionError {
-    /// Error spawning the Firecracker process
-    ProcessSpawnError(String),
     /// Error communicating with Firecracker API
+    #[error("API communication error: {0}")]
     ApiCommunicationError(String),
     /// Execution timeout
+    #[error("Execution timed out after 30 seconds")]
     TimeoutError,
+    #[error("Execution timed out. Logs:\n{0}")]
+    TimeoutErrorWithLogs(String),
     /// JSON serialization/deserialization error
+    #[error("Serialization error: {0}")]
     SerializationError(String),
     /// Resource-related error (socket, file system, etc.)
+    #[error("Resource management error: {0}")]
     ResourceError(String),
-    /// VM configuration error
-    ConfigurationError(String),
-    /// VM startup error
-    StartupError(String),
+    /// Error spawning a process
+    #[error("Process spawning error: {0}")]
+    ProcessSpawnError(String),
 }
 
-impl fmt::Display for ExecutionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ExecutionError::ProcessSpawnError(msg) => write!(f, "Process spawn error: {}", msg),
-            ExecutionError::ApiCommunicationError(msg) => {
-                write!(f, "API communication error: {}", msg)
-            }
-            ExecutionError::TimeoutError => write!(f, "Execution timeout"),
-            ExecutionError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
-            ExecutionError::ResourceError(msg) => write!(f, "Resource error: {}", msg),
-            ExecutionError::ConfigurationError(msg) => write!(f, "Configuration error: {}", msg),
-            ExecutionError::StartupError(msg) => write!(f, "VM startup error: {}", msg),
-        }
+impl IntoResponse for ExecutionError {
+    fn into_response(self) -> axum::response::Response {
+        let status = match self {
+            ExecutionError::ApiCommunicationError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ExecutionError::TimeoutError => StatusCode::INTERNAL_SERVER_ERROR,
+            ExecutionError::TimeoutErrorWithLogs(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ExecutionError::SerializationError(_) => StatusCode::BAD_REQUEST,
+            ExecutionError::ResourceError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ExecutionError::ProcessSpawnError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let body = Json(serde_json::json!({
+            "error": self.to_string(),
+        }));
+        (status, body).into_response()
     }
 }
-
-impl std::error::Error for ExecutionError {}
 
 /// Generate a unique VM identifier
 pub fn generate_vm_id() -> String {
@@ -139,9 +142,15 @@ mod tests {
     #[test]
     fn test_execution_error_display() {
         let error = ExecutionError::ProcessSpawnError("failed to start".to_string());
-        assert_eq!(format!("{}", error), "Process spawn error: failed to start");
+        assert_eq!(
+            format!("{}", error),
+            "Process spawning error: failed to start"
+        );
 
         let timeout_error = ExecutionError::TimeoutError;
-        assert_eq!(format!("{}", timeout_error), "Execution timeout");
+        assert_eq!(
+            format!("{}", timeout_error),
+            "Execution timed out after 30 seconds"
+        );
     }
 }
