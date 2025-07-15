@@ -1,7 +1,7 @@
 use axum::{
     Router, extract::Json, http::StatusCode, response::Json as ResponseJson, routing::post,
 };
-use firecracker_poc::{ExecuteRequest, ExecuteResponse, create_error_response, run_in_vm};
+use firecracker_poc::{ExecuteRequest, ExecuteResponse, create_error_response, run_in_vm, runner};
 use std::net::SocketAddr;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
@@ -34,7 +34,7 @@ async fn execute_handler(
         }
         Err(e) => {
             error!("Code execution failed: {}", e);
-            let error_response = create_error_response(format!("Execution failed: {}", e));
+            let error_response = create_error_response(format!("Execution failed: {e}"));
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(error_response),
@@ -75,6 +75,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Available endpoints:");
     info!("  POST /execute - Execute Python code in secure microVM");
     info!("  GET  /health  - Health check endpoint");
+
+    // Pre-warm VM pool in background
+    tokio::spawn(async {
+        info!("Pre-warming VM pool ({} VMs)...", runner::VM_PREWARM_COUNT);
+        for i in 1..=runner::VM_PREWARM_COUNT {
+            match runner::create_new_vm().await {
+                Ok(vm) => {
+                    let mut pool = runner::VM_POOL.lock().await;
+                    pool.push_back(vm);
+                    debug!("Pre-warmed VM {} added to pool", i);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to pre-warm VM {}: {}", i, e);
+                }
+            }
+        }
+        info!("VM pool pre-warming completed");
+    });
 
     // Start server
     axum::serve(listener, app).await?;
@@ -130,7 +148,7 @@ mod tests {
         let app = create_app();
         let long_code = "a".repeat(10_001);
 
-        let request_body = format!(r#"{{"code": "{}"}}"#, long_code);
+        let request_body = format!(r#"{{"code": "{long_code}"}}"#);
 
         let response = app
             .oneshot(
