@@ -12,3 +12,5 @@ so that it could receive the code from http, run it and return the
 result. With this, we don't need to hack on init. Please alter the
 runner.rs code and provide a script to generate the proper rootfs that
 contains the API server.
+
+it works well! However the latency is pretty big. Can you optimize it to make the latency as small as possible?
