@@ -143,13 +143,13 @@ mod tests {
     fn test_execution_error_display() {
         let error = ExecutionError::ProcessSpawnError("failed to start".to_string());
         assert_eq!(
-            format!("{}", error),
+            format!("{error}"),
             "Process spawning error: failed to start"
         );
 
         let timeout_error = ExecutionError::TimeoutError;
         assert_eq!(
-            format!("{}", timeout_error),
+            format!("{timeout_error}"),
             "Execution timed out after 30 seconds"
         );
     }

@@ -34,7 +34,7 @@ async fn execute_handler(
         }
         Err(e) => {
             error!("Code execution failed: {}", e);
-            let error_response = create_error_response(format!("Execution failed: {}", e));
+            let error_response = create_error_response(format!("Execution failed: {e}"));
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ResponseJson(error_response),
@@ -148,7 +148,7 @@ mod tests {
         let app = create_app();
         let long_code = "a".repeat(10_001);
 
-        let request_body = format!(r#"{{"code": "{}"}}"#, long_code);
+        let request_body = format!(r#"{{"code": "{long_code}"}}"#);
 
         let response = app
             .oneshot(

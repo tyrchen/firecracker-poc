@@ -34,14 +34,14 @@ impl Default for VMManager {
         let tap_interface = format!("tap-{}", &vm_id[..8]);
         // Generate unique subnet for each VM (172.16.x.0/24 where x is based on VM ID)
         let subnet_id = u32::from_str_radix(&vm_id[..8], 16).unwrap_or(1) % 254 + 1;
-        let vm_ip = format!("172.16.{}.2", subnet_id);
+        let vm_ip = format!("172.16.{subnet_id}.2");
 
         Self {
             vm_id: vm_id.clone(),
-            socket_path: format!("/tmp/firecracker-{}.socket", vm_id),
+            socket_path: format!("/tmp/firecracker-{vm_id}.socket"),
             process: None,
-            stdout_log_path: format!("/tmp/fc-stdout-{}.log", vm_id),
-            stderr_log_path: format!("/tmp/fc-stderr-{}.log", vm_id),
+            stdout_log_path: format!("/tmp/fc-stdout-{vm_id}.log"),
+            stderr_log_path: format!("/tmp/fc-stderr-{vm_id}.log"),
             vm_ip,
             tap_interface,
         }
@@ -138,11 +138,11 @@ impl VMManager {
         let tap_interface = format!("tap-{}", &vm_id[..8]);
         // Generate unique subnet for each VM (172.16.x.0/24 where x is based on VM ID)
         let subnet_id = u32::from_str_radix(&vm_id[..8], 16).unwrap_or(1) % 254 + 1;
-        let vm_ip = format!("172.16.{}.2", subnet_id);
+        let vm_ip = format!("172.16.{subnet_id}.2");
 
-        let socket_path = format!("/tmp/firecracker-{}.socket", vm_id);
-        let stdout_log_path = format!("/tmp/fc-stdout-{}.log", vm_id);
-        let stderr_log_path = format!("/tmp/fc-stderr-{}.log", vm_id);
+        let socket_path = format!("/tmp/firecracker-{vm_id}.socket");
+        let stdout_log_path = format!("/tmp/fc-stdout-{vm_id}.log");
+        let stderr_log_path = format!("/tmp/fc-stderr-{vm_id}.log");
 
         Ok(Self {
             vm_id,
@@ -178,7 +178,7 @@ impl VMManager {
             .status()
             .await
             .map_err(|e| {
-                ExecutionError::ResourceError(format!("Failed to create TAP interface: {}", e))
+                ExecutionError::ResourceError(format!("Failed to create TAP interface: {e}"))
             })?;
 
         if !tap_status.success() {
@@ -191,7 +191,7 @@ impl VMManager {
         let host_ip = {
             let vm_ip_parts: Vec<&str> = self.vm_ip.split('.').collect();
             let subnet_id = vm_ip_parts[2];
-            format!("172.16.{}.1/24", subnet_id)
+            format!("172.16.{subnet_id}.1/24")
         };
 
         let ip_status = tokio::process::Command::new("sudo")
@@ -204,7 +204,7 @@ impl VMManager {
             .status()
             .await
             .map_err(|e| {
-                ExecutionError::ResourceError(format!("Failed to configure TAP interface: {}", e))
+                ExecutionError::ResourceError(format!("Failed to configure TAP interface: {e}"))
             })?;
 
         if !ip_status.success() {
@@ -224,7 +224,7 @@ impl VMManager {
             .status()
             .await
             .map_err(|e| {
-                ExecutionError::ResourceError(format!("Failed to bring up TAP interface: {}", e))
+                ExecutionError::ResourceError(format!("Failed to bring up TAP interface: {e}"))
             })?;
 
         if !up_status.success() {
@@ -406,10 +406,10 @@ impl VMManager {
         // Read the VM logs to help debug
         let stdout_log = tokio::fs::read_to_string(&self.stdout_log_path)
             .await
-            .unwrap_or_else(|e| format!("Failed to read stdout log: {}", e));
+            .unwrap_or_else(|e| format!("Failed to read stdout log: {e}"));
         let stderr_log = tokio::fs::read_to_string(&self.stderr_log_path)
             .await
-            .unwrap_or_else(|e| format!("Failed to read stderr log: {}", e));
+            .unwrap_or_else(|e| format!("Failed to read stderr log: {e}"));
 
         let log_details = format!(
             "VM API server at {} did not become ready within {} seconds\n\nFirecracker stdout:\n{}\n\nFirecracker stderr:\n{}",
@@ -428,7 +428,7 @@ impl VMManager {
         if is_test_mode() {
             tracing::debug!("Returning mock response in test mode");
             return Ok(ExecuteResponse {
-                stdout: format!("Mock execution of: {}\n", code),
+                stdout: format!("Mock execution of: {code}\n"),
                 stderr: "".to_string(),
                 success: true,
             });
@@ -447,7 +447,7 @@ impl VMManager {
             .send()
             .await
             .map_err(|e| {
-                ExecutionError::ApiCommunicationError(format!("Failed to send request: {}", e))
+                ExecutionError::ApiCommunicationError(format!("Failed to send request: {e}"))
             })?;
 
         if !response.status().is_success() {
@@ -458,7 +458,7 @@ impl VMManager {
         }
 
         let api_response: serde_json::Value = response.json().await.map_err(|e| {
-            ExecutionError::ApiCommunicationError(format!("Failed to parse response: {}", e))
+            ExecutionError::ApiCommunicationError(format!("Failed to parse response: {e}"))
         })?;
 
         Ok(ExecuteResponse {
@@ -495,12 +495,10 @@ impl VMManager {
             tracing::debug!("Skipping Firecracker start in test mode");
             return Ok(());
         }
-        let stdout_log_file = std::fs::File::create(&self.stdout_log_path).map_err(|e| {
-            ExecutionError::ResourceError(format!("cannot create stdout log: {}", e))
-        })?;
-        let stderr_log_file = std::fs::File::create(&self.stderr_log_path).map_err(|e| {
-            ExecutionError::ResourceError(format!("cannot create stderr log: {}", e))
-        })?;
+        let stdout_log_file = std::fs::File::create(&self.stdout_log_path)
+            .map_err(|e| ExecutionError::ResourceError(format!("cannot create stdout log: {e}")))?;
+        let stderr_log_file = std::fs::File::create(&self.stderr_log_path)
+            .map_err(|e| ExecutionError::ResourceError(format!("cannot create stderr log: {e}")))?;
 
         let child = tokio::process::Command::new("firecracker")
             .arg("--api-sock")
@@ -510,7 +508,7 @@ impl VMManager {
             .stderr(stderr_log_file)
             .spawn()
             .map_err(|e| {
-                ExecutionError::ProcessSpawnError(format!("Failed to start Firecracker: {}", e))
+                ExecutionError::ProcessSpawnError(format!("Failed to start Firecracker: {e}"))
             })?;
         self.process = Some(child);
         tokio::time::sleep(Duration::from_millis(100)).await; // Give time for socket to be created
@@ -534,16 +532,16 @@ impl VMManager {
             request_builder
                 .body(Full::new(Bytes::from(json_body.to_string())))
                 .map_err(|e| {
-                    ExecutionError::ApiCommunicationError(format!("Request build failed: {}", e))
+                    ExecutionError::ApiCommunicationError(format!("Request build failed: {e}"))
                 })?
         } else {
             request_builder.body(Full::new(Bytes::new())).map_err(|e| {
-                ExecutionError::ApiCommunicationError(format!("Request build failed: {}", e))
+                ExecutionError::ApiCommunicationError(format!("Request build failed: {e}"))
             })?
         };
 
         let response = client.request(request).await.map_err(|e| {
-            ExecutionError::ApiCommunicationError(format!("API request failed: {}", e))
+            ExecutionError::ApiCommunicationError(format!("API request failed: {e}"))
         })?;
 
         let status = response.status();
@@ -554,15 +552,13 @@ impl VMManager {
                 .await
                 .map_err(|e| {
                     ExecutionError::ApiCommunicationError(format!(
-                        "Failed to read error response: {}",
-                        e
+                        "Failed to read error response: {e}"
                     ))
                 })?
                 .to_bytes();
             let error_body = String::from_utf8_lossy(&body_bytes);
             return Err(ExecutionError::ApiCommunicationError(format!(
-                "API returned error status: {} for {} {}. Error details: {}",
-                status, method, path, error_body
+                "API returned error status: {status} for {method} {path}. Error details: {error_body}"
             )));
         }
         Ok(())
@@ -578,7 +574,7 @@ impl VMManager {
         let machine_config = tokio::fs::read_to_string("fixtures/machine.json")
             .await
             .map_err(|e| {
-                ExecutionError::ResourceError(format!("Failed to read machine config: {}", e))
+                ExecutionError::ResourceError(format!("Failed to read machine config: {e}"))
             })?;
         let machine_config: serde_json::Value = serde_json::from_str(&machine_config).unwrap();
         self.send_api_request(
@@ -588,13 +584,13 @@ impl VMManager {
         )
         .await
         .map_err(|e| {
-            ExecutionError::ApiCommunicationError(format!("Machine config failed: {}", e))
+            ExecutionError::ApiCommunicationError(format!("Machine config failed: {e}"))
         })?;
 
         let host_ip = {
             let vm_ip_parts: Vec<&str> = self.vm_ip.split('.').collect();
             let subnet_id = vm_ip_parts[2];
-            format!("172.16.{}.1", subnet_id)
+            format!("172.16.{subnet_id}.1")
         };
         let boot_args = format!(
             "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/bin/startup.sh ip={}::{}:255.255.255.0::eth0:off",
@@ -604,14 +600,14 @@ impl VMManager {
         self.send_api_request(Method::PUT, "/boot-source", Some(&boot_source.to_string()))
             .await
             .map_err(|e| {
-                ExecutionError::ApiCommunicationError(format!("Boot source config failed: {}", e))
+                ExecutionError::ApiCommunicationError(format!("Boot source config failed: {e}"))
             })?;
 
         let rootfs = serde_json::json!({ "drive_id": "rootfs", "path_on_host": "./alpine-python-api.ext4", "is_root_device": true, "is_read_only": false });
         self.send_api_request(Method::PUT, "/drives/rootfs", Some(&rootfs.to_string()))
             .await
             .map_err(|e| {
-                ExecutionError::ApiCommunicationError(format!("Rootfs config failed: {}", e))
+                ExecutionError::ApiCommunicationError(format!("Rootfs config failed: {e}"))
             })?;
 
         // Configure network interface
@@ -627,15 +623,13 @@ impl VMManager {
         )
         .await
         .map_err(|e| {
-            ExecutionError::ApiCommunicationError(format!("Network config failed: {}", e))
+            ExecutionError::ApiCommunicationError(format!("Network config failed: {e}"))
         })?;
 
         let start_action = serde_json::json!({ "action_type": "InstanceStart" });
         self.send_api_request(Method::PUT, "/actions", Some(&start_action.to_string()))
             .await
-            .map_err(|e| {
-                ExecutionError::ApiCommunicationError(format!("VM start failed: {}", e))
-            })?;
+            .map_err(|e| ExecutionError::ApiCommunicationError(format!("VM start failed: {e}")))?;
         Ok(())
     }
 
@@ -656,7 +650,7 @@ impl VMManager {
             tokio::fs::remove_file(&self.socket_path)
                 .await
                 .map_err(|e| {
-                    ExecutionError::ResourceError(format!("Failed to remove socket: {}", e))
+                    ExecutionError::ResourceError(format!("Failed to remove socket: {e}"))
                 })?;
         }
         if tokio::fs::try_exists(&self.stdout_log_path)
@@ -666,7 +660,7 @@ impl VMManager {
             tokio::fs::remove_file(&self.stdout_log_path)
                 .await
                 .map_err(|e| {
-                    ExecutionError::ResourceError(format!("Failed to remove stdout log: {}", e))
+                    ExecutionError::ResourceError(format!("Failed to remove stdout log: {e}"))
                 })?;
         }
         if tokio::fs::try_exists(&self.stderr_log_path)
@@ -676,7 +670,7 @@ impl VMManager {
             tokio::fs::remove_file(&self.stderr_log_path)
                 .await
                 .map_err(|e| {
-                    ExecutionError::ResourceError(format!("Failed to remove stderr log: {}", e))
+                    ExecutionError::ResourceError(format!("Failed to remove stderr log: {e}"))
                 })?;
         }
         Ok(())
